@@ -49,15 +49,75 @@ Based on the issue discussion, my current understanding is that operation-level 
 
 ### Steps to Reproduce
 
-1. [Step 1]
-2. [Step 2]
-3. [Observed result]
+The goal of reproduction is to demonstrate the current limitation: with only a
+single **global** sample rate, you cannot sample high-volume operations
+aggressively while keeping full visibility into low-volume operations. Lowering
+the global rate to reduce quota cost causes low-volume operations to be missed
+entirely.
+
+1. Clone the fork and check out the working branch:
+   ```bash
+   git clone https://github.com/ChaoyangS/console.git
+   cd console
+   git checkout feat/operation-level-sample-rates
+   ```
+2. Install the pinned toolchain. The repo requires Node `>=24.14.1` (see
+   `.node-version`) and pnpm `10.33.2`, and enforces this via `engine-strict`:
+   ```bash
+   fnm install        # reads .node-version (24.14.1)
+   fnm use
+   corepack enable
+   corepack prepare pnpm@10.33.2 --activate
+   ```
+3. Install dependencies from the repo root:
+   ```bash
+   pnpm install
+   ```
+4. Run the demonstration script, which simulates a mixed-volume workload (two
+   high-volume operations plus several low-volume ones) and prints how many
+   operations each sampling strategy would report:
+   ```bash
+   cd packages/libraries/core
+   pnpm exec tsx demo/operation-sample-rates.ts
+   ```
+5. Observe the output and confirm the problem:
+   - In the **`Global sampleRate = 0.05`** section, the low-volume operations
+     (`AdminAuditReport`, `RareMigrationQuery`) report `sent=0` and are marked
+     `MISSED` — a low global rate saves quota but loses all visibility into rare
+     operations.
+   - In the **`Global sampleRate = 1.0`** section, every operation is billed at
+     100%, including the two high-volume operations that dominate the total —
+     this reproduces the "overpay for quota" side of the trade-off.
+
+This confirms the issue: a single global sample rate forces a choice between
+overpaying on quota and losing visibility into low-volume operations.
 
 ### Reproduction Evidence
 
-- **Commit showing reproduction:** [Link to commit in your fork]
-- **Screenshots/logs:** [If applicable]
-- **My findings:** [What you discovered during reproduction]
+- **Branch in my fork:** https://github.com/ChaoyangS/console/tree/feat/operation-level-sample-rates
+- **Commit showing reproduction:** https://github.com/ChaoyangS/console/commit/8e7f50f10
+- **Screenshots/logs:** Output of `pnpm exec tsx demo/operation-sample-rates.ts`:
+  ```
+  === Global sampleRate = 0.05 (low-volume ops missed) ===
+    AdminAuditReport     volume=     40  sent=      0 (  0.0%)  MISSED
+    RareMigrationQuery   volume=      8  sent=      0 (  0.0%)  MISSED
+    TOTAL                volume= 751248  sent=  37581 (5.0% of quota)
+
+  === Operation-level: /^HighVolume/ -> 1%, fallback 100% ===
+    HighVolumeFeed       volume= 500000  sent=   5125 (  1.0%)  visible
+    AdminAuditReport     volume=     40  sent=     40 (100.0%)  visible
+    RareMigrationQuery   volume=      8  sent=      8 (100.0%)  visible
+    TOTAL                volume= 751248  sent=   8998 (1.2% of quota)
+  ```
+- **My findings:** Sampling lives in `@graphql-hive/core`
+  (`packages/libraries/core/src/client/`). The existing `randomSampling` in
+  `sampling.ts` applies one global rate to every operation, and `usage.ts`
+  selects it in the `shouldInclude` logic. There is already a per-operation
+  `exclude` list and a dynamic `sampler` callback, but no declarative way to set
+  different rates per operation. The reproduction confirms that lowering the
+  global rate drops 100% of low-volume operations, while operation-level rates
+  cut billed volume to ~1.2% of quota and still report low-volume operations at
+  100%.
 
 ---
 
@@ -75,20 +135,44 @@ Based on the issue discussion, my current understanding is that operation-level 
 
 Using UMPIRE framework (adapted):
 
-**Understand:** [Restate the problem]
+**Understand:** A single global sample rate cannot serve a workload that mixes
+high-volume and low-volume operations. Users need a way to set sample rates per
+operation, where an operation-level rate takes priority and the global rate is
+the fallback.
 
-**Match:** [What similar patterns/solutions exist in the codebase?]
+**Match:** The usage plugin in `@graphql-hive/core` already has closely related
+patterns to follow: the `exclude` option matches operations by exact name or
+regex, and the `sampler` callback computes a rate dynamically from a
+`SamplingContext` that includes `operationName`. The new config mirrors
+`exclude`'s name/regex matching and reuses the existing `shouldInclude`
+selection point in `usage.ts`.
 
-**Plan:** [Step-by-step implementation plan]
-1. [Modify file X to do Y]
-2. [Add function Z]
-3. [Update tests]
+**Plan:** Step-by-step implementation plan:
+1. Add an `OperationSampleRate` type (`name` or `regex` + `sampleRate`) and a new
+   `sampleRates?: OperationSampleRate[]` option to `HiveUsagePluginOptions` in
+   `packages/libraries/core/src/client/types.ts`.
+2. Add an `operationSampling()` factory in `sampling.ts` that returns a
+   `shouldInclude(context)` function: first matching rule wins, unmatched
+   operations fall back to the global `sampleRate`, and rules are validated
+   eagerly (exactly one of name/regex, rate within `0..1`).
+3. Wire `sampleRates` into the `shouldInclude` selection in `usage.ts`, keeping
+   precedence: `exclude` > `sampler` > `sampleRates` > global `sampleRate`.
+4. Add unit tests for the precedence and validation logic, plus an end-to-end
+   usage test, and a runnable demo that quantifies the quota savings.
+5. Add a changeset describing the new option (semver `minor`).
 
-**Implement:** [Link to your branch/commits as you work]
+**Implement:** Branch:
+https://github.com/ChaoyangS/console/tree/feat/operation-level-sample-rates
 
-**Review:** [Self-review checklist - does it follow the project's contribution guidelines?]
+**Review:** Followed existing code style and the `exclude`/`sampler` patterns;
+added a changeset per the project's Changesets workflow; kept the change scoped
+to `@graphql-hive/core` with no breaking changes (the new option is optional and
+defaults to existing behavior).
 
-**Evaluate:** [How will you verify it works?]
+**Evaluate:** `pnpm --filter @graphql-hive/core typecheck` passes, the new and
+existing tests pass (`vitest run` on the sampling and usage suites), and the
+demo script shows operation-level sampling billing ~1.2% of quota while keeping
+low-volume operations at 100% visibility.
 
 ---
 
